@@ -337,8 +337,10 @@ async def test_http_batch() -> TestResult:
 
 
 async def test_http_huge_batch() -> TestResult:
-    r = TestResult("HTTP - 超大批量流式压缩")
+    r = TestResult("HTTP - 超大批量流式压缩 + 同批真值对比")
     try:
+        import numpy as np
+
         app = _make_app()
         runner = web.AppRunner(app)
         await runner.setup()
@@ -346,9 +348,16 @@ async def test_http_huge_batch() -> TestResult:
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
 
-        # 发一个 50000 条的大批次
+        # 固定随机种子, 用同一批数据做真值对比
         N = 50000
-        values = [random.random() * 1000 for _ in range(N)]
+        rng = random.Random(42)
+        values = [rng.paretovariate(1.3) * 5.0 for _ in range(N)]
+
+        # 先在客户端计算这批数据的真值 (numpy 全量排序)
+        truth_arr = np.sort(np.array(values, dtype=np.float64))
+        truth_p50 = float(np.quantile(truth_arr, 0.5))
+        truth_p95 = float(np.quantile(truth_arr, 0.95))
+        truth_p99 = float(np.quantile(truth_arr, 0.99))
 
         async with ClientSession() as session:
             url = f"http://127.0.0.1:{port}/ingest"
@@ -361,30 +370,59 @@ async def test_http_huge_batch() -> TestResult:
 
         await runner.cleanup()
 
-        r.add_detail(f"status: {status}")
-        r.add_detail(f"count: {body.get('count')}")
         all_stats = stats_body.get("stats", {})
         all_info = all_stats.get("all", {})
+        svc_p50 = all_info.get("p50", 0.0)
+        svc_p95 = all_info.get("p95", 0.0)
+        svc_p99 = all_info.get("p99", 0.0)
+
+        def rel_err(true_v, est_v):
+            if true_v == 0:
+                return 0.0 if est_v == 0 else float("inf")
+            return abs(est_v - true_v) / abs(true_v) * 100
+
+        err_p50 = rel_err(truth_p50, svc_p50)
+        err_p95 = rel_err(truth_p95, svc_p95)
+        err_p99 = rel_err(truth_p99, svc_p99)
+
+        r.add_detail(f"上报数据条数: {N}")
+        r.add_detail(f"ingest status: {status}, count={body.get('count')}")
         r.add_detail(f"服务端 count: {all_info.get('count')}")
-        r.add_detail(f"服务端 centroids: {all_info.get('num_centroids')}")
-        r.add_detail(f"p50={all_info.get('p50'):.2f}, p95={all_info.get('p95'):.2f}, p99={all_info.get('p99'):.2f}")
+        r.add_detail(f"质心数: {all_info.get('num_centroids')}")
+        r.add_detail(f"p50: 真值={truth_p50:.3f}, 估计={svc_p50:.3f}, 误差={err_p50:.2f}%")
+        r.add_detail(f"p95: 真值={truth_p95:.3f}, 估计={svc_p95:.3f}, 误差={err_p95:.2f}%")
+        r.add_detail(f"p99: 真值={truth_p99:.3f}, 估计={svc_p99:.3f}, 误差={err_p99:.2f}%")
 
+        # 检查点
+        checks = []
         if status != 200:
-            r.fail(f"期望 200, 实际 {status}")
-            return r
+            checks.append(f"ingest status 期望 200, 实际 {status}")
         if body.get("count") != N:
-            r.fail(f"count 应为 {N}, 实际 {body.get('count')}")
-            return r
+            checks.append(f"响应 count 应为 {N}, 实际 {body.get('count')}")
         if all_info.get("count") != N:
-            r.fail(f"服务端 count 应为 {N}, 实际 {all_info.get('count')}")
+            checks.append(f"服务端 count 应为 {N}, 实际 {all_info.get('count')}")
+
+        centroids = all_info.get("num_centroids", 0)
+        if not (0 < centroids < 5000):
+            checks.append(f"质心数异常: {centroids}")
+
+        # 误差检查: p99 允许稍大 (长尾)
+        if err_p50 > 5:
+            checks.append(f"p50 误差过大: {err_p50:.2f}%")
+        if err_p95 > 5:
+            checks.append(f"p95 误差过大: {err_p95:.2f}%")
+        if err_p99 > 10:
+            checks.append(f"p99 误差过大: {err_p99:.2f}%")
+
+        if checks:
+            r.fail("; ".join(checks))
             return r
 
-        # 关键验证: centroids 数量应该是 O(delta) 级别, 远小于 N
-        centroids = all_info.get("num_centroids", 0)
-        if centroids > 0 and centroids < 5000:  # delta=100, 通常几百个质心
-            r.pass_(f"超大批量 N={N}, 质心数={centroids}, 压缩比 {N/centroids:.0f}x, 分位数可正常查询")
-        else:
-            r.fail(f"质心数异常: {centroids}")
+        compress_ratio = N / centroids
+        r.pass_(
+            f"N={N}, 质心={centroids}, 压缩比 {compress_ratio:.0f}x, "
+            f"max_err=max({err_p50:.1f}%,{err_p95:.1f}%,{err_p99:.1f}%)"
+        )
     except Exception as e:
         r.fail(f"异常: {e}\n{traceback.format_exc()}")
     return r
@@ -403,12 +441,21 @@ async def test_http_invalid_values() -> TestResult:
         test_cases = [
             ("单值 NaN", {"metric": "bad1", "value": float("nan")}, "NaN"),
             ("单值 Inf", {"metric": "bad2", "value": float("inf")}, "Infinity"),
-            ("单值 字符串", {"metric": "bad3", "value": "abc"}, "finite number"),
+            ("单值 字符串abc", {"metric": "bad3", "value": "abc"}, "got string"),
+            ("单值 数字字符串\"123\"", {"metric": "bad3c", "value": "123"}, "got string"),
+            ("单值 null", {"metric": "bad3d", "value": None}, "got null"),
             ("单值 bool", {"metric": "bad3b", "value": True}, "boolean"),
             ("批量含 NaN", {"metric": "bad4", "values": [1, 2, float("nan"), 3]}, "NaN"),
             ("批量含 Inf", {"metric": "bad5", "values": [1, 2, float("inf"), 3]}, "Infinity"),
-            ("批量含字符串", {"metric": "bad6", "values": [1, "hello", 3]}, "convert"),
-            ("批量非数组", {"metric": "bad7", "values": "not_a_list"}, "list"),
+            ("批量含普通字符串", {"metric": "bad6", "values": [1, "hello", 3]}, "got string"),
+            ("批量含数字字符串", {"metric": "bad6b", "values": [1, "123", 3]}, "got string"),
+            ("批量含 null", {"metric": "bad6c", "values": [1, None, 3]}, "got null"),
+            ("批量含 bool", {"metric": "bad6d", "values": [1, True, 3]}, "boolean"),
+            ("批量含对象数组", {"metric": "bad6e", "values": [1, {"x": 1}, 3]}, "got object"),
+            ("批量含嵌套数组", {"metric": "bad6f", "values": [1, [1, 2], 3]}, "got array"),
+            ("批量 null", {"metric": "bad7b", "values": None}, "got null"),
+            ("批量非数组", {"metric": "bad7", "values": "not_a_list"}, "got string"),
+            ("批量空数组", {"metric": "bad7c", "values": []}, "empty"),
             ("缺失 metric", {"value": 42}, "metric"),
         ]
 
@@ -420,14 +467,17 @@ async def test_http_invalid_values() -> TestResult:
                     body = await resp.json()
                     status = resp.status
 
-                ok = status == 400 and body.get("ok") is False and expected_err_substr.lower() in body.get("error", "").lower()
-                detail = f"status={status}, ok={body.get('ok')}, error='{body.get('error')}'"
+                err_msg = body.get("error", "")
+                ok = (
+                    status == 400
+                    and body.get("ok") is False
+                    and expected_err_substr.lower() in err_msg.lower()
+                )
+                detail = f"status={status}, ok={body.get('ok')}, error='{err_msg}'"
                 r.add_detail(f"{name}: {'✓' if ok else '✗'} {detail}")
                 if not ok:
                     all_pass = False
 
-        # 额外验证: 错误格式统一 (ok=False + error 字段)
-        # 并且写入失败后, 不应该污染已有数据
         await runner.cleanup()
 
         if all_pass:

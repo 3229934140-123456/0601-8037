@@ -1,6 +1,12 @@
 """
 高并发分位数统计服务 - HTTP API
 
+流式写入设计:
+    POST /ingest 的超大 values 数组不会被完整加载为 Python 对象列表。
+    使用 ijson 从 JSON bytes 中流式提取单个数字, 按批处理写入 digest,
+    内存峰值 = HTTP body bytes + 小批量缓存(默认500条) + digest 质心摘要,
+    不会随 values 条数线性增长.
+
 启动:
     python server.py
 
@@ -21,11 +27,13 @@ API:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import time
-from typing import List, Tuple
+from typing import Any, Iterator, List, Tuple
 
+import ijson
 from aiohttp import web
 
 from quantile_service import QuantileService
@@ -34,50 +42,160 @@ routes = web.RouteTableDef()
 
 svc: QuantileService = None
 
+_STREAM_BATCH_SIZE = 500
+
 
 def _error_response(message: str, status: int = 400) -> web.Response:
     """统一的错误响应格式"""
     return web.json_response({"ok": False, "error": message}, status=status)
 
 
-def _is_valid_number(x) -> bool:
-    """检查是否是合法的有限数字"""
-    if isinstance(x, bool):
-        return False
-    if not isinstance(x, (int, float)):
-        return False
-    f = float(x)
-    return not (math.isnan(f) or math.isinf(f))
+def _type_name(v: Any) -> str:
+    """返回值的 JSON 语义类型名"""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return type(v).__name__
 
 
-def _validate_float_list(raw_list) -> Tuple[List[float], List[str]]:
+def _check_strict_number(v: Any) -> Tuple[bool, float, str]:
     """
-    校验并转换 float 列表.
-    返回 (合法值列表, 错误信息列表).
+    严格检查 v 是不是 JSON number (Python int/float, 排除 bool).
+    返回 (ok, float_value, error_msg).
+    不做任何隐式转换: "123" 字符串直接拒绝.
+    """
+    if isinstance(v, bool):
+        return False, 0.0, "boolean is not a valid number"
+    if not isinstance(v, (int, float)):
+        return False, 0.0, f"expected number, got {_type_name(v)}"
+    f = float(v)
+    if math.isnan(f):
+        return False, 0.0, "NaN is not allowed"
+    if math.isinf(f):
+        return False, 0.0, "Infinity is not allowed"
+    return True, f, ""
+
+
+def _validate_and_convert_strict(raw_list: Any) -> Tuple[List[float], List[str]]:
+    """
+    严格校验 values 列表: 只接受真正的 JSON number.
+    不把 "123" 这种字符串当数字.
+    返回 (转换后的 float 列表, 错误信息列表).
     """
     values: List[float] = []
     errors: List[str] = []
     for i, v in enumerate(raw_list):
-        if isinstance(v, bool):
-            errors.append(f"index {i}: boolean is not a valid number")
-            continue
-        try:
-            fv = float(v)
-        except (TypeError, ValueError):
-            errors.append(f"index {i}: cannot convert '{v}' to number")
-            continue
-        if math.isnan(fv):
-            errors.append(f"index {i}: NaN is not allowed")
-            continue
-        if math.isinf(fv):
-            errors.append(f"index {i}: Infinity is not allowed")
+        ok, fv, msg = _check_strict_number(v)
+        if not ok:
+            errors.append(f"index {i}: {msg}")
             continue
         values.append(fv)
     return values, errors
 
 
+async def _streaming_ingest_body(
+    data_bytes: bytes
+) -> Tuple[bool, str, int, str]:
+    """
+    使用 ijson 流式解析 JSON body.
+    - 不构建完整的 values Python 列表
+    - 逐元素提取, 校验后按批写入 svc
+    返回 (成功?, metric, count, 错误信息)
+    """
+    buf = io.BytesIO(data_bytes)
+
+    metric: str = ""
+    try:
+        for prefix, event, value in ijson.parse(buf):
+            if prefix == "metric" and event == "string":
+                metric = value
+                break
+            if prefix == "metric":
+                return False, "", 0, (
+                    "missing or invalid 'metric' (string required)"
+                )
+    except Exception as e:
+        return False, "", 0, f"invalid json body: {e}"
+
+    if not metric:
+        return False, "", 0, "missing or invalid 'metric' (string required)"
+
+    buf.seek(0)
+    count = 0
+    batch: List[float] = []
+    idx = -1
+
+    try:
+        for item in ijson.items(buf, "values.item"):
+            idx += 1
+            ok, fv, msg = _check_strict_number(item)
+            if not ok:
+                return False, metric, 0, (
+                    f"invalid values in 'values': index {idx}: {msg}"
+                )
+            batch.append(fv)
+            count += 1
+            if len(batch) >= _STREAM_BATCH_SIZE:
+                svc.record_batch(metric, batch)
+                batch = []
+    except ijson.JSONError as e:
+        return False, metric, 0, f"invalid json body: {e}"
+
+    if idx == -1:
+        buf.seek(0)
+        try:
+            top_keys = list(ijson.keys(buf, ""))
+        except Exception:
+            top_keys = []
+        if "values" not in top_keys and "value" not in top_keys:
+            return False, metric, 0, "missing 'value' or 'values' in body"
+        if "values" in top_keys:
+            buf.seek(0)
+            obj = json.loads(data_bytes)
+            vals = obj.get("values")
+            if vals is None:
+                return False, metric, 0, (
+                    "invalid values in 'values': expected array, got null"
+                )
+            if not isinstance(vals, list):
+                return False, metric, 0, (
+                    f"'values' must be a list of numbers, got {_type_name(vals)}"
+                )
+            if len(vals) == 0:
+                return False, metric, 0, "'values' cannot be empty"
+        return False, metric, 0, "missing 'value' or 'values' in body"
+
+    if batch:
+        svc.record_batch(metric, batch)
+        batch = []
+
+    if count == 0:
+        return False, metric, 0, "'values' cannot be empty"
+
+    return True, metric, count, ""
+
+
 @routes.post("/ingest")
 async def ingest(request: web.Request) -> web.Response:
+    content_length = request.content_length
+    big_payload = content_length is not None and content_length > 1_000_000
+
+    if big_payload:
+        data_bytes = await request.read()
+        ok, metric, count, err_msg = await _streaming_ingest_body(data_bytes)
+        if not ok:
+            return _error_response(err_msg, 400)
+        return web.json_response({"ok": True, "count": count})
+
     try:
         data = await request.json()
     except Exception:
@@ -88,14 +206,23 @@ async def ingest(request: web.Request) -> web.Response:
 
     metric = data.get("metric")
     if not metric or not isinstance(metric, str):
-        return _error_response("missing or invalid 'metric' (string required)", 400)
+        return _error_response(
+            "missing or invalid 'metric' (string required)", 400
+        )
 
     if "values" in data:
         raw_values = data["values"]
+        if raw_values is None:
+            return _error_response(
+                "'values' must be a list of numbers, got null", 400
+            )
         if not isinstance(raw_values, list):
-            return _error_response("'values' must be a list of numbers", 400)
+            return _error_response(
+                f"'values' must be a list of numbers, got {_type_name(raw_values)}",
+                400,
+            )
 
-        values, errors = _validate_float_list(raw_values)
+        values, errors = _validate_and_convert_strict(raw_values)
         if errors:
             return _error_response(
                 f"invalid values in 'values': {'; '.join(errors)}", 400
@@ -109,20 +236,10 @@ async def ingest(request: web.Request) -> web.Response:
 
     if "value" in data:
         raw_value = data["value"]
-        if not _is_valid_number(raw_value):
-            if isinstance(raw_value, bool):
-                return _error_response("invalid 'value': boolean is not a valid number", 400)
-            try:
-                fv = float(raw_value)
-                if math.isnan(fv):
-                    return _error_response("invalid 'value': NaN is not allowed", 400)
-                if math.isinf(fv):
-                    return _error_response("invalid 'value': Infinity is not allowed", 400)
-            except (TypeError, ValueError):
-                pass
-            return _error_response("invalid 'value': must be a finite number", 400)
-
-        svc.record(metric, float(raw_value))
+        ok, fv, msg = _check_strict_number(raw_value)
+        if not ok:
+            return _error_response(f"invalid 'value': {msg}", 400)
+        svc.record(metric, fv)
         return web.json_response({"ok": True, "count": 1})
 
     return _error_response("missing 'value' or 'values' in body", 400)
