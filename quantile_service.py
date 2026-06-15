@@ -48,6 +48,15 @@ class WindowedDigest:
         with shard.lock:
             shard.digest.add_list(values)
 
+    def merge_digest(self, other: TDigest, shard_idx: int) -> None:
+        """
+        合并一个已经校验好的 TDigest (原子性批量提交用).
+        只合并到指定分片, 保证负载均衡.
+        """
+        shard = self.shards[shard_idx % self.num_shards]
+        with shard.lock:
+            shard.digest.merge(other)
+
     def snapshot(self) -> TDigest:
         merged = TDigest(delta=self.shards[0].digest.delta)
         for shard in self.shards:
@@ -133,6 +142,18 @@ class QuantileService:
         shard_idx = self._next_shard()
         for wd in wds.values():
             wd.add_batch(values, shard_idx)
+
+    def record_digest(self, metric: str, digest: TDigest) -> None:
+        """
+        合并一个已经校验好的 TDigest (流式原子性批量提交用).
+        用于流式解析场景: 全部校验通过后, 一次性合并到服务端.
+        """
+        if digest is None or digest.count == 0:
+            return
+        wds = self._get_or_create(metric)
+        shard_idx = self._next_shard()
+        for wd in wds.values():
+            wd.merge_digest(digest, shard_idx)
 
     def query(
         self, metric: str, quantiles: List[float], window: str = "all"

@@ -2,10 +2,16 @@
 高并发分位数统计服务 - HTTP API
 
 流式写入设计:
-    POST /ingest 的超大 values 数组不会被完整加载为 Python 对象列表。
-    使用 ijson 从 JSON bytes 中流式提取单个数字, 按批处理写入 digest,
-    内存峰值 = HTTP body bytes + 小批量缓存(默认500条) + digest 质心摘要,
-    不会随 values 条数线性增长.
+    POST /ingest 的超大 values 数组:
+    1. 使用 aiohttp 流式读取 request body, 边读边解析 (不攒完整 bytes)
+    2. 使用 ijson 增量解析 JSON, 逐个取出 values.item
+    3. 先校验并写入临时 TDigest (全内存校验阶段)
+    4. 全部校验通过后, 把临时 TDigest merge 到服务端的分片 digest
+    5. 任何一项非法 → 临时 TDigest 直接丢弃, 服务端数据 untouched
+
+内存峰值 = 网络接收缓冲区 + 流式批量缓存(500条) + 临时 TDigest 质心(≈几百个)
+          + 服务端分片 digest 质心摘要
+不会随 values 条数线性增长.
 
 启动:
     python server.py
@@ -31,11 +37,13 @@ import io
 import json
 import math
 import time
-from typing import Any, Iterator, List, Tuple
+from decimal import Decimal
+from typing import Any, AsyncGenerator, List, Tuple
 
 import ijson
 from aiohttp import web
 
+from tdigest import TDigest
 from quantile_service import QuantileService
 
 routes = web.RouteTableDef()
@@ -43,6 +51,7 @@ routes = web.RouteTableDef()
 svc: QuantileService = None
 
 _STREAM_BATCH_SIZE = 500
+_BIG_PAYLOAD_THRESHOLD = 500_000  # 500KB 以上走流式
 
 
 def _error_response(message: str, status: int = 400) -> web.Response:
@@ -56,7 +65,7 @@ def _type_name(v: Any) -> str:
         return "null"
     if isinstance(v, bool):
         return "boolean"
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float, Decimal)):
         return "number"
     if isinstance(v, str):
         return "string"
@@ -69,12 +78,23 @@ def _type_name(v: Any) -> str:
 
 def _check_strict_number(v: Any) -> Tuple[bool, float, str]:
     """
-    严格检查 v 是不是 JSON number (Python int/float, 排除 bool).
+    严格检查 v 是不是 JSON number (Python int/float/Decimal, 排除 bool).
     返回 (ok, float_value, error_msg).
     不做任何隐式转换: "123" 字符串直接拒绝.
+    Decimal 来自 ijson 流式解析, 是合法的 JSON number.
     """
     if isinstance(v, bool):
         return False, 0.0, "boolean is not a valid number"
+    if isinstance(v, Decimal):
+        try:
+            f = float(v)
+        except Exception:
+            return False, 0.0, "cannot convert Decimal to float"
+        if math.isnan(f):
+            return False, 0.0, "NaN is not allowed"
+        if math.isinf(f):
+            return False, 0.0, "Infinity is not allowed"
+        return True, f, ""
     if not isinstance(v, (int, float)):
         return False, 0.0, f"expected number, got {_type_name(v)}"
     f = float(v)
@@ -102,100 +122,164 @@ def _validate_and_convert_strict(raw_list: Any) -> Tuple[List[float], List[str]]
     return values, errors
 
 
-async def _streaming_ingest_body(
-    data_bytes: bytes
-) -> Tuple[bool, str, int, str]:
+class _AsyncByteStream:
     """
-    使用 ijson 流式解析 JSON body.
-    - 不构建完整的 values Python 列表
-    - 逐元素提取, 校验后按批写入 svc
-    返回 (成功?, metric, count, 错误信息)
+    适配器: 把 aiohttp StreamReader 包装成带异步 read 方法的文件类对象.
+    ijson.parse_async 需要 await f.read(n) 接口.
     """
-    buf = io.BytesIO(data_bytes)
 
-    metric: str = ""
-    try:
-        for prefix, event, value in ijson.parse(buf):
-            if prefix == "metric" and event == "string":
-                metric = value
+    def __init__(self, content):
+        self._content = content
+        self._buffer = b""
+        self._eof = False
+
+    async def read(self, n: int = -1) -> bytes:
+        """异步读接口, 供 ijson.parse_async 调用."""
+        if self._eof and not self._buffer:
+            return b""
+
+        if n == -1:
+            while not self._eof:
+                chunk = await self._content.readany()
+                if not chunk:
+                    self._eof = True
+                    break
+                self._buffer += chunk
+            result = self._buffer
+            self._buffer = b""
+            return result
+
+        while len(self._buffer) < n and not self._eof:
+            chunk = await self._content.readany()
+            if not chunk:
+                self._eof = True
                 break
-            if prefix == "metric":
-                return False, "", 0, (
-                    "missing or invalid 'metric' (string required)"
-                )
-    except Exception as e:
-        return False, "", 0, f"invalid json body: {e}"
+            self._buffer += chunk
 
-    if not metric:
-        return False, "", 0, "missing or invalid 'metric' (string required)"
+        result = self._buffer[:n]
+        self._buffer = self._buffer[n:]
+        return result
 
-    buf.seek(0)
-    count = 0
-    batch: List[float] = []
+
+async def _stream_and_validate(
+    content,
+) -> Tuple[bool, str, TDigest, str]:
+    """
+    真正的流式处理: 边读 request body 边解析边校验.
+    校验通过返回 (True, metric, 临时digest, "")
+    校验失败返回 (False, metric, 空digest, 错误信息)
+
+    关键: 全部校验通过后才会把临时 digest merge 到服务端.
+          中间任何一项非法 → 整批丢弃, 服务端数据 untouched.
+    """
+    stream = _AsyncByteStream(content)
+    pending_digest = TDigest(delta=svc.delta if svc else 100.0)
+
+    metric = ""
+    metric_seen = False
+    values_seen = False
+    has_value_single = False
     idx = -1
 
     try:
-        for item in ijson.items(buf, "values.item"):
-            idx += 1
-            ok, fv, msg = _check_strict_number(item)
-            if not ok:
-                return False, metric, 0, (
-                    f"invalid values in 'values': index {idx}: {msg}"
+        async for prefix, event, value in ijson.parse_async(stream):
+            if prefix == "metric" and event == "string":
+                metric = value
+                metric_seen = True
+                continue
+            if prefix == "metric" and event != "string":
+                return False, "", TDigest(), (
+                    "missing or invalid 'metric' (string required)"
                 )
-            batch.append(fv)
-            count += 1
-            if len(batch) >= _STREAM_BATCH_SIZE:
-                svc.record_batch(metric, batch)
-                batch = []
+
+            if prefix == "value":
+                has_value_single = True
+                if not metric_seen:
+                    return False, "", TDigest(), (
+                        "missing or invalid 'metric' (string required)"
+                    )
+                ok, fv, msg = _check_strict_number(value)
+                if not ok:
+                    return False, metric, TDigest(), f"invalid 'value': {msg}"
+                tmp = TDigest(delta=svc.delta if svc else 100.0)
+                tmp.add(fv)
+                return True, metric, tmp, ""
+
+            if prefix == "values":
+                if event == "start_array":
+                    values_seen = True
+                    continue
+                if event == "null":
+                    return False, metric if metric_seen else "", TDigest(), (
+                        "'values' must be a list of numbers, got null"
+                    )
+                if event not in ("start_array", "end_array", "map_key"):
+                    t = _type_name(value)
+                    return False, metric if metric_seen else "", TDigest(), (
+                        f"'values' must be a list of numbers, got {t}"
+                    )
+
+            if prefix == "values.item":
+                if not metric_seen:
+                    return False, "", TDigest(), (
+                        "missing or invalid 'metric' (string required)"
+                    )
+                idx += 1
+                ok, fv, msg = _check_strict_number(value)
+                if not ok:
+                    return False, metric, TDigest(), (
+                        f"invalid values in 'values': index {idx}: {msg}"
+                    )
+                pending_digest.add(fv)
+
     except ijson.JSONError as e:
-        return False, metric, 0, f"invalid json body: {e}"
+        return False, metric if metric_seen else "", TDigest(), (
+            f"invalid json body: {e}"
+        )
+
+    if not metric_seen:
+        return False, "", TDigest(), (
+            "missing or invalid 'metric' (string required)"
+        )
+
+    if has_value_single:
+        return True, metric, pending_digest, ""
+
+    if not values_seen:
+        return False, metric, TDigest(), (
+            "missing 'value' or 'values' in body"
+        )
 
     if idx == -1:
-        buf.seek(0)
-        try:
-            top_keys = list(ijson.keys(buf, ""))
-        except Exception:
-            top_keys = []
-        if "values" not in top_keys and "value" not in top_keys:
-            return False, metric, 0, "missing 'value' or 'values' in body"
-        if "values" in top_keys:
-            buf.seek(0)
-            obj = json.loads(data_bytes)
-            vals = obj.get("values")
-            if vals is None:
-                return False, metric, 0, (
-                    "invalid values in 'values': expected array, got null"
-                )
-            if not isinstance(vals, list):
-                return False, metric, 0, (
-                    f"'values' must be a list of numbers, got {_type_name(vals)}"
-                )
-            if len(vals) == 0:
-                return False, metric, 0, "'values' cannot be empty"
-        return False, metric, 0, "missing 'value' or 'values' in body"
+        return False, metric, TDigest(), "'values' cannot be empty"
 
-    if batch:
-        svc.record_batch(metric, batch)
-        batch = []
-
-    if count == 0:
-        return False, metric, 0, "'values' cannot be empty"
-
-    return True, metric, count, ""
+    return True, metric, pending_digest, ""
 
 
 @routes.post("/ingest")
 async def ingest(request: web.Request) -> web.Response:
     content_length = request.content_length
-    big_payload = content_length is not None and content_length > 1_000_000
+    big_payload = (
+        content_length is None or content_length > _BIG_PAYLOAD_THRESHOLD
+    )
 
     if big_payload:
-        data_bytes = await request.read()
-        ok, metric, count, err_msg = await _streaming_ingest_body(data_bytes)
+        # 真正的流式处理: 边读边校验, 不攒完整 body
+        ok, metric, pending_digest, err_msg = await _stream_and_validate(
+            request.content
+        )
         if not ok:
             return _error_response(err_msg, 400)
+
+        count = pending_digest.count
+        if count == 0:
+            return _error_response("no valid values received", 400)
+
+        # 全部校验通过, 才把临时 digest 合并到服务端
+        svc.record_digest(metric, pending_digest)
         return web.json_response({"ok": True, "count": count})
 
+    # 小 payload: 走原来的快速路径 (完整 JSON 解析)
     try:
         data = await request.json()
     except Exception:
@@ -249,7 +333,9 @@ async def ingest(request: web.Request) -> web.Response:
 async def query(request: web.Request) -> web.Response:
     metric = request.query.get("metric")
     if not metric:
-        return web.json_response({"error": "missing 'metric'"}, status=400)
+        return web.json_response(
+            {"ok": False, "error": "missing 'metric'"}, status=400
+        )
 
     qs_raw: List[str] = request.query.getall("q", [])
     if not qs_raw:
@@ -271,10 +357,14 @@ async def query(request: web.Request) -> web.Response:
     result = svc.query(metric, quantiles, window=window)
 
     resp = {
+        "ok": True,
         "metric": metric,
         "window": window,
-        "quantiles": {f"p{int(q * 100)}" if q == int(q * 100) / 100 else f"{q}": v
-                      for q, v in result.items()},
+        "count": svc.stats(metric).get(window, {}).get("count", 0),
+        "quantiles": {
+            f"p{int(q * 100)}" if q == int(q * 100) / 100 else f"{q}": v
+            for q, v in result.items()
+        },
     }
     return web.json_response(resp)
 
@@ -283,18 +373,20 @@ async def query(request: web.Request) -> web.Response:
 async def stats(request: web.Request) -> web.Response:
     metric = request.query.get("metric")
     if not metric:
-        return web.json_response({"error": "missing 'metric'"}, status=400)
-    return web.json_response({"metric": metric, "stats": svc.stats(metric)})
+        return web.json_response(
+            {"ok": False, "error": "missing 'metric'"}, status=400
+        )
+    return web.json_response({"ok": True, "metric": metric, "stats": svc.stats(metric)})
 
 
 @routes.get("/metrics")
 async def list_metrics(request: web.Request) -> web.Response:
-    return web.json_response({"metrics": svc.list_metrics()})
+    return web.json_response({"ok": True, "metrics": svc.list_metrics()})
 
 
 @routes.get("/health")
 async def health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "ts": time.time()})
+    return web.json_response({"ok": True, "status": "ok", "ts": time.time()})
 
 
 def create_app() -> web.Application:
@@ -321,6 +413,7 @@ def main() -> None:
 
     print(f"[QuantileService] starting on {args.host}:{args.port}")
     print(f"[QuantileService] delta={args.delta}, shards={args.shards}")
+    print(f"[QuantileService] 流式阈值: {_BIG_PAYLOAD_THRESHOLD} bytes")
     web.run_app(app, host=args.host, port=args.port)
 
 
