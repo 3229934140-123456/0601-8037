@@ -70,20 +70,58 @@ class TDigest:
         """
         return 4.0 * self.total_weight * q * (1.0 - q) / self.delta
 
-    def add(self, value: float, weight: float = 1.0) -> None:
-        """添加一个数据点(带可选权重)"""
+    @staticmethod
+    def _is_valid_number(x: float) -> bool:
+        """检查数值是否合法(非NaN, 非Inf/-Inf)"""
+        return not (math.isnan(x) or math.isinf(x))
+
+    def add(self, value: float, weight: float = 1.0) -> bool:
+        """
+        添加一个数据点(带可选权重).
+        返回 True 表示添加成功, False 表示值非法(NaN/Inf)被拒绝.
+        流式处理: 缓冲区满了就立即压缩, 内存使用有界.
+        """
+        if not self._is_valid_number(value) or weight <= 0:
+            return False
         self.buffer.append((value, weight))
         self.total_weight += weight
         if len(self.buffer) >= self.buffer_size:
             self._flush_buffer()
+        return True
 
-    def add_list(self, values: List[float]) -> None:
-        """批量添加数据点"""
+    def add_list(self, values: List[float]) -> int:
+        """
+        流式批量添加数据点.
+        内存不会随values大小线性增长: 每积累 buffer_size 个点就压缩一次.
+        返回成功添加的数量(过滤掉 NaN/Inf 后的值).
+        """
+        added = 0
         for v in values:
+            if not self._is_valid_number(v):
+                continue
             self.buffer.append((v, 1.0))
             self.total_weight += 1.0
-        if len(self.buffer) >= self.buffer_size:
-            self._flush_buffer()
+            added += 1
+            if len(self.buffer) >= self.buffer_size:
+                self._flush_buffer()
+        return added
+
+    def add_weighted(self, pairs: List[Tuple[float, float]]) -> int:
+        """
+        流式批量添加带权重的数据点.
+        pairs: [(value, weight), ...]
+        返回成功添加的数量.
+        """
+        added = 0
+        for v, w in pairs:
+            if not self._is_valid_number(v) or w <= 0:
+                continue
+            self.buffer.append((v, w))
+            self.total_weight += w
+            added += 1
+            if len(self.buffer) >= self.buffer_size:
+                self._flush_buffer()
+        return added
 
     def _flush_buffer(self) -> None:
         """
@@ -130,12 +168,16 @@ class TDigest:
         """
         查询q分位数 (q ∈ [0, 1]).
         使用线性插值在质心之间估算.
+        若digest为空, 返回 0.0(调用方应通过count判断是否有数据).
         """
         if not self.centroids:
             if self.buffer:
                 self._flush_buffer()
             else:
-                return float("nan")
+                return 0.0
+
+        if not self.centroids:
+            return 0.0
 
         if q <= 0.0:
             return self.centroids[0].mean
@@ -147,23 +189,29 @@ class TDigest:
 
         for i, c in enumerate(self.centroids):
             if cumulative + c.weight >= target:
-                if i == 0:
+                if i == 0 or c.weight <= 0:
                     return c.mean
                 prev = self.centroids[i - 1]
                 offset = target - cumulative
-                frac = offset / c.weight if c.weight > 0 else 0.0
+                frac = offset / c.weight
                 return prev.mean + frac * (c.mean - prev.mean)
             cumulative += c.weight
 
         return self.centroids[-1].mean
 
     def cdf(self, x: float) -> float:
-        """查询值x对应的累积分布函数值(即P(X <= x))"""
+        """
+        查询值x对应的累积分布函数值(即P(X <= x)).
+        若digest为空, 返回 0.0.
+        """
         if not self.centroids:
             if self.buffer:
                 self._flush_buffer()
             else:
-                return float("nan")
+                return 0.0
+
+        if not self.centroids:
+            return 0.0
 
         if x <= self.centroids[0].mean:
             return 0.0
@@ -178,9 +226,8 @@ class TDigest:
                 prev = self.centroids[i - 1]
                 span = c.mean - prev.mean
                 if span <= 0:
-                    frac = 0.0
-                else:
-                    frac = (x - prev.mean) / span
+                    return cumulative / self.total_weight
+                frac = (x - prev.mean) / span
                 return (cumulative + frac * c.weight) / self.total_weight
             cumulative += c.weight
         return 1.0

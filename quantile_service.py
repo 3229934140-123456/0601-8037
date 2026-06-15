@@ -146,18 +146,20 @@ class QuantileService:
             window: 窗口名, 如 "1m", "5m", "15m", "all"
 
         返回:
-            {分位数: 估算值} 的字典
+            {分位数: 估算值} 的字典. 若指标不存在或无数据, 值为 0.0.
         """
         if metric not in self._metrics:
-            return {q: float("nan") for q in quantiles}
+            return {q: 0.0 for q in quantiles}
 
         self._maybe_rotate(metric)
 
         wds = self._metrics[metric]
         if window not in wds:
-            return {q: float("nan") for q in quantiles}
+            return {q: 0.0 for q in quantiles}
 
         digest = wds[window].snapshot()
+        if digest.count == 0:
+            return {q: 0.0 for q in quantiles}
         return {q: digest.quantile(q) for q in quantiles}
 
     def query_all_windows(

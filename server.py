@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
-from typing import List
+from typing import List, Tuple
 
 from aiohttp import web
 
@@ -34,33 +35,97 @@ routes = web.RouteTableDef()
 svc: QuantileService = None
 
 
+def _error_response(message: str, status: int = 400) -> web.Response:
+    """统一的错误响应格式"""
+    return web.json_response({"ok": False, "error": message}, status=status)
+
+
+def _is_valid_number(x) -> bool:
+    """检查是否是合法的有限数字"""
+    if isinstance(x, bool):
+        return False
+    if not isinstance(x, (int, float)):
+        return False
+    f = float(x)
+    return not (math.isnan(f) or math.isinf(f))
+
+
+def _validate_float_list(raw_list) -> Tuple[List[float], List[str]]:
+    """
+    校验并转换 float 列表.
+    返回 (合法值列表, 错误信息列表).
+    """
+    values: List[float] = []
+    errors: List[str] = []
+    for i, v in enumerate(raw_list):
+        if isinstance(v, bool):
+            errors.append(f"index {i}: boolean is not a valid number")
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            errors.append(f"index {i}: cannot convert '{v}' to number")
+            continue
+        if math.isnan(fv):
+            errors.append(f"index {i}: NaN is not allowed")
+            continue
+        if math.isinf(fv):
+            errors.append(f"index {i}: Infinity is not allowed")
+            continue
+        values.append(fv)
+    return values, errors
+
+
 @routes.post("/ingest")
 async def ingest(request: web.Request) -> web.Response:
     try:
         data = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid json"}, status=400)
+        return _error_response("invalid json body", 400)
+
+    if not isinstance(data, dict):
+        return _error_response("body must be a JSON object", 400)
 
     metric = data.get("metric")
-    if not metric:
-        return web.json_response({"error": "missing 'metric'"}, status=400)
+    if not metric or not isinstance(metric, str):
+        return _error_response("missing or invalid 'metric' (string required)", 400)
 
     if "values" in data:
-        values = data["values"]
-        if not isinstance(values, list):
-            return web.json_response({"error": "'values' must be a list"}, status=400)
-        svc.record_batch(metric, [float(v) for v in values])
+        raw_values = data["values"]
+        if not isinstance(raw_values, list):
+            return _error_response("'values' must be a list of numbers", 400)
+
+        values, errors = _validate_float_list(raw_values)
+        if errors:
+            return _error_response(
+                f"invalid values in 'values': {'; '.join(errors)}", 400
+            )
+
+        if not values:
+            return _error_response("'values' cannot be empty", 400)
+
+        svc.record_batch(metric, values)
         return web.json_response({"ok": True, "count": len(values)})
 
     if "value" in data:
-        try:
-            value = float(data["value"])
-        except (TypeError, ValueError):
-            return web.json_response({"error": "invalid 'value'"}, status=400)
-        svc.record(metric, value)
+        raw_value = data["value"]
+        if not _is_valid_number(raw_value):
+            if isinstance(raw_value, bool):
+                return _error_response("invalid 'value': boolean is not a valid number", 400)
+            try:
+                fv = float(raw_value)
+                if math.isnan(fv):
+                    return _error_response("invalid 'value': NaN is not allowed", 400)
+                if math.isinf(fv):
+                    return _error_response("invalid 'value': Infinity is not allowed", 400)
+            except (TypeError, ValueError):
+                pass
+            return _error_response("invalid 'value': must be a finite number", 400)
+
+        svc.record(metric, float(raw_value))
         return web.json_response({"ok": True, "count": 1})
 
-    return web.json_response({"error": "missing 'value' or 'values'"}, status=400)
+    return _error_response("missing 'value' or 'values' in body", 400)
 
 
 @routes.get("/query")
